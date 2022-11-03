@@ -1,7 +1,28 @@
-- when:
-    condition: "<< parameters, checkout_from_github >>"
+version: 2.1
+
+parameters:
+  run_integration_tests:
+    type: boolean
+    default: false
+  deploy:
+    type: boolean
+    default: false
+
+workflows:
+  version: 2
+  integration_tests:
+    when: << pipeline.parameters.run_integration_tests >>
+    jobs:
+      - mytestjob
+
+jobs:
+  mytestjob:
     steps:
-      - run: echo "Preparing to deploy version << parameters, checkout_from_github >>"
+      - checkout
+      - when:
+          condition: "<< parameters, checkout_from_github >>"
+          steps:
+            - run: echo "Preparing to deploy version << parameters, checkout_from_github >>"
 
 
 

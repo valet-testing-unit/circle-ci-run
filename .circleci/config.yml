@@ -18,6 +18,7 @@ jobs:
           condition: << pipeline.parameters.deploy >>
           steps:
             - run: echo "Preparing to deploy version"
+            - run: echo "Preparing to deploy version << pipeline.parameters.tag-to-deploy >>"
 
 workflows:
   integration_tests:

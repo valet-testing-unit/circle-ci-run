@@ -1,27 +1,288 @@
 version: 2.1
 
 parameters:
-  run_integration_tests:
+  trunk_branch_name:
+    type: string
+    default: "main" # default for Jarden GitHub repos is 'main' - change if your trunk branch is something else, e.g. "master"
+  deploy-to-test:
     type: boolean
     default: false
-  deploy:
+  deploy-to-uat:
     type: boolean
     default: false
+  deploy-to-prod:
+    type: boolean
+    default: false
+  build-service:
+    type: boolean
+    default: true
+  tag-to-deploy:
+    type: string
+    default: ""
 
-jobs:
-  mytestjob:
-    docker:
-      - image: 'cimg/base:stable'
+ignore_trunk: &ignore_trunk
+  filters:
+    branches:
+      ignore:
+        - << pipeline.parameters.trunk_branch_name >>
+
+trunk_only: &trunk_only
+  filters:
+    branches:
+      only: << pipeline.parameters.trunk_branch_name >>
+
+build_workspace_executor: &build_workspace_executor
+  docker:
+    - image: 556743994161.dkr.ecr.ap-southeast-2.amazonaws.com/jarden/base-images:jarden-build-image-1.0.6
+  working_directory: /tmp
+
+deploy_workspace_executor: &deploy_workspace_executor
+  docker:
+    - image: 556743994161.dkr.ecr.ap-southeast-2.amazonaws.com/jarden/base-images:jarden-deploy-image-1.0.13
+      environment:
+        CI: "true"
+        AWS_DEFAULT_OUTPUT: json
+  working_directory: /tmp
+
+jobs:  
+  initialise:
+    <<: *build_workspace_executor
     steps:
-      - checkout
-      - when:
-          condition: << pipeline.parameters.deploy >>
-          steps:
-            - run: echo "Preparing to deploy version"
-            - run: echo "Preparing to deploy version << pipeline.parameters.tag-to-deploy >>"
+      - run:
+          name: Create workspace
+          command: mkdir -p workspace
+      - checkout:
+          path: /tmp/workspace
+      - run:
+          name: Setup github
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/githubSetup.sh
+      - run:
+          name: Install dependencies
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/installDependencies.sh
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - .
+  build:
+    <<: *build_workspace_executor
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Build
+          command: | 
+            cd /tmp/workspace 
+            .circleci/scripts/project/build.sh
+      - persist_to_workspace:
+          root: workspace
+          paths:
+            - .
 
+  static_analysis:
+    <<: *build_workspace_executor
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Static analysis
+          command: | 
+            cd /tmp/workspace 
+            .circleci/scripts/project/staticAnalysis.sh
+
+  test_unit_and_test_coverage:
+    <<: *build_workspace_executor
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Unit test && coverage report
+          command: | 
+            cd /tmp/workspace 
+            .circleci/scripts/project/unitTest.sh
+      - store_test_results:
+          path: workspace/reports/unit
+      - store_artifacts:
+          path: workspace/reports/coverage
+
+  branch_test_build_lambda_artifacts:
+    <<: *deploy_workspace_executor
+    steps:
+    - attach_workspace:
+          at: /tmp/workspace
+    - run:
+          name: Setup github
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/githubSetup.sh
+    - run:
+        name:  Create the lambda artifact version
+        command: |
+          cd /tmp/workspace
+          .circleci/scripts/project/artifactVersion.sh
+    - run:
+        name: Build lambda
+        command: |
+          cd /tmp/workspace
+          npm run compile
+          .circleci/scripts/project/create_zip.sh
+
+  trunk_build_tag_push_lambda_artifacts:
+    <<: *deploy_workspace_executor
+    steps:
+      - attach_workspace:
+            at: /tmp/workspace
+      - run:
+          name: Setup github
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/githubSetup.sh
+      - setup_remote_docker:
+          docker_layer_caching: true
+      - run:
+          name:  Create the lambda artifact version
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/artifactVersion.sh
+      - run:
+          name: create lambda zip
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/project/create_zip.sh
+      - run:
+          name: Set up S3 bucket to upload lambda zips into
+          command: |
+            cd /tmp/workspace
+            .circleci/scripts/infra/createS3Infra.sh
+      - run:
+          name: Upload lambda artifacts into S3 bucket
+          command: |
+            cd /tmp/workspace
+              .circleci/scripts/infra/upload-lambda-artifacts.sh
+      - run:
+          name: Push next version
+          command: cd /tmp/workspace && git push origin << pipeline.parameters.trunk_branch_name >> --tags
+
+      - persist_to_workspace:
+          root: /tmp/workspace
+          paths:
+            - .
+  
+  deploy:
+    description: A job for deploying a specific image tag version
+    <<: *deploy_workspace_executor
+    parameters:
+      account:
+        type: enum
+        default: "non-prod"
+        enum: ["non-prod", "prod"]
+      environment:
+        type: enum
+        default: "test"
+        enum: ["test", "uat", "prod"]
+      checkout_from_github:
+        type: boolean
+        default: false
+
+    steps:
+      - when:
+          condition: << parameters.checkout_from_github >>
+          steps:
+            - run: echo "Preparing to deploy version << pipeline.parameters.tag-to-deploy >>"
+            - run: echo "Checkout and clone repo steps are being run as the build is trggered through tag"
+            - run:
+                name: Create workspace
+                command: mkdir -p workspace
+            - run:
+                name: Add github public keys
+                command: mkdir -p ~/.ssh/ && ssh-keyscan github.com >> ~/.ssh/known_hosts
+            - run:
+                name: Clone repo
+                command: |
+                  cd /tmp/workspace
+                  git clone `echo ${CIRCLE_REPOSITORY_URL}` .
+            - run:
+                  name: Setup github
+                  command: |
+                    cd /tmp/workspace
+                    .circleci/scripts/project/githubSetup.sh   
+            - run:
+                name: Deploy lambda function and other resources
+                command: |
+                  cd /tmp/workspace
+                  .circleci/scripts/infra/deploy_tag.sh << parameters.account >> << parameters.environment >> << pipeline.parameters.tag-to-deploy >>
+      - unless:
+          condition: << parameters.checkout_from_github >>
+          steps:
+            - attach_workspace:
+                at: /tmp/workspace
+            - run: echo "Checkout and clone repo steps are skipped as the build is trggered through commit in trunk branch"
+            - run:
+                name: Setup github
+                command: |
+                  cd /tmp/workspace
+                  .circleci/scripts/project/githubSetup.sh    
+            - run:
+                name: Deploy lambda function and other resources
+                command: |
+                  cd /tmp/workspace
+                  .circleci/scripts/infra/deploy.sh << parameters.account >> << parameters.environment >>
+ 
 workflows:
-  integration_tests:
-    when: << pipeline.parameters.run_integration_tests >>
+  deploy_to_uat:
+    when: << pipeline.parameters.deploy-to-uat >>
     jobs:
-      - mytestjob
+      - deploy:
+          account: "non-prod"
+          environment: "uat"
+          checkout_from_github: true
+          context: pipeline_context
+
+  deploy_to_prod:
+    when: << pipeline.parameters.deploy-to-prod >>
+    jobs:
+      - deploy:
+          account: "prod"
+          environment: "prod"
+          checkout_from_github: true
+          context: pipeline_context   
+
+  build_and_test:
+    when: << pipeline.parameters.build-service >>
+    jobs:
+      - initialise:
+          context: pipeline_context
+      - build:
+          context: pipeline_context
+          requires:
+            - initialise
+      - static_analysis:
+          context: pipeline_context
+          requires:
+            - build
+      - test_unit_and_test_coverage:
+          context: pipeline_context
+          requires:
+            - build
+      # test_build_lambda_artifacts only on branches that are NOT 'trunk'
+      - branch_test_build_lambda_artifacts:
+          <<: *ignore_trunk
+          context: pipeline_context
+          requires:
+            - test_unit_and_test_coverage
+      - trunk_build_tag_push_lambda_artifacts:
+          <<: *trunk_only
+          context: pipeline_context
+          requires:
+            - test_unit_and_test_coverage
+      -  deploy:
+          <<: *trunk_only
+          account: "non-prod"
+          environment: "test"
+          checkout_from_github: false
+          context: pipeline_context
+          requires:
+            - trunk_build_tag_push_lambda_artifacts

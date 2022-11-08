@@ -44,16 +44,6 @@ deploy_workspace_executor: &deploy_workspace_executor
         AWS_DEFAULT_OUTPUT: json
   working_directory: /tmp
 
-commands:
-  sayhello:
-    description: "A very simple command for demonstration purposes"
-    parameters:
-      to:
-        type: string
-        default: "GitHub!"
-    steps:
-      - run: echo << parameters.to >>
-
 jobs:  
   initialise:
     <<: *build_workspace_executor
@@ -201,8 +191,6 @@ jobs:
       - when:
           condition: << parameters.checkout_from_github >>
           steps:
-            - sayhello:
-                to: "Sophie!"
             - run: echo "Preparing to deploy version << pipeline.parameters.tag-to-deploy >>"
             - run: echo "Checkout and clone repo steps are being run as the build is trggered through tag"
             - run:
